@@ -1,0 +1,224 @@
+% V2G Dashboard Full App Script
+classdef V2GChargingDashboard < matlab.apps.AppBase
+
+    properties (Access = public)
+        UIFigure              matlab.ui.Figure
+        TitleLabel            matlab.ui.control.Label
+        FooterLabel           matlab.ui.control.Label
+        VehicleDropDown       matlab.ui.control.DropDown
+        VehicleInfoPanel      matlab.ui.container.Panel
+        VehicleInfoLabel      matlab.ui.control.Label
+        SoCGauge              matlab.ui.control.SemicircularGauge
+        BatteryCurrentLabel   matlab.ui.control.Label
+        BatteryVoltageLabel   matlab.ui.control.Label
+        RangeEstimateLabel    matlab.ui.control.Label
+        ModeSwitchLabel       matlab.ui.control.Label
+        ModeSwitch            matlab.ui.container.ButtonGroup
+        StartStopButton       matlab.ui.control.Button
+        PauseButton           matlab.ui.control.Button
+        StopButton            matlab.ui.control.Button
+        StatusPanel           matlab.ui.container.Panel
+        StatusLabel           matlab.ui.control.Label
+        PowerFlowPanel        matlab.ui.container.Panel
+        PowerFlowAxes         matlab.ui.control.UIAxes
+        SoCPanel              matlab.ui.container.Panel
+        SoCAxes               matlab.ui.control.UIAxes
+        CurrentPanel          matlab.ui.container.Panel
+        CurrentAxes           matlab.ui.control.UIAxes
+        PowerFlowLine
+        SoCLine
+        CurrentLine
+        LogTextArea           matlab.ui.control.TextArea
+        TimerObj              timer
+        ModelName             char = 'V2GSimulation15'
+        BatteryCapacity       double = 100
+        Running               logical = false
+    end
+
+    methods (Access = private)
+
+        function updateLiveSignals(app)
+            try
+                soc = get_param([app.ModelName '/SOC_Read'], 'RuntimeObject');
+                current = get_param([app.ModelName '/Current_Read'], 'RuntimeObject');
+                voltage = get_param([app.ModelName '/Voltage_Read'], 'RuntimeObject');
+
+                if ~isempty(soc)
+                    soc_val = soc.OutputPort(1).Data;
+                    ib_val = current.OutputPort(1).Data;
+                    vb_val = voltage.OutputPort(1).Data;
+
+                    t = datetime('now');
+                    t_sec = seconds(t - datetime('today'));
+
+                    addpoints(app.SoCLine, t_sec, soc_val);
+                    addpoints(app.CurrentLine, t_sec, ib_val);
+                    addpoints(app.PowerFlowLine, t_sec, ib_val * vb_val / 1000);
+
+                    app.SoCGauge.Value = soc_val;
+                    app.BatteryCurrentLabel.Text = ['Current: ', num2str(ib_val, '%.2f'), ' A'];
+                    app.BatteryVoltageLabel.Text = ['Voltage: ', num2str(vb_val, '%.2f'), ' V'];
+
+                    drawnow;
+                end
+            catch ME
+                app.log(['[Live update error: ', ME.message, ']']);
+            end
+        end
+
+        function updateVehicleInfo(app)
+            vehicle = app.VehicleDropDown.Value;
+            switch vehicle
+                case 'Tractor'
+                    app.BatteryCapacity = 100;
+                    info = sprintf('Battery Capacity: 100 kWh\nVoltage: 400 V');
+                case 'Leisure boat'
+                    app.BatteryCapacity = 80;
+                    info = sprintf('Battery Capacity: 80 kWh\nVoltage: 350 V');
+                case 'Motorcycle'
+                    app.BatteryCapacity = 20;
+                    info = sprintf('Battery Capacity: 20 kWh\nVoltage: 300 V');
+            end
+            app.VehicleInfoLabel.Text = info;
+        end
+
+        function switchMode(app)
+            if ~app.Running
+                controlVal = double(strcmp(app.ModeSwitch.SelectedObject.Text, 'Discharging'));
+                set_param([app.ModelName '/Constant'], 'Value', num2str(controlVal));
+                app.log(['? Mode set to: ', app.ModeSwitch.SelectedObject.Text]);
+            end
+        end
+
+        function toggleCharging(app)
+            simStatus = get_param(app.ModelName, 'SimulationStatus');
+
+            if strcmp(simStatus, 'stopped')
+                set_param(app.ModelName, 'SimulationCommand', 'start');
+                app.log('[Simulation started...]');
+            elseif strcmp(simStatus, 'paused')
+                set_param(app.ModelName, 'SimulationCommand', 'continue');
+                app.log('[Simulation continued...]');
+            end
+
+            mode = app.ModeSwitch.SelectedObject.Text;
+            app.StatusLabel.Text = upper(mode);
+            app.Running = true;
+            start(app.TimerObj);
+        end
+
+        function pauseSimulation(app)
+            set_param(app.ModelName, 'SimulationCommand', 'pause');
+            app.StatusLabel.Text = 'IDLE';
+            app.Running = false;
+            app.log('[Simulation paused.]');
+            stop(app.TimerObj);
+        end
+
+        function stopSimulation(app)
+            set_param(app.ModelName, 'SimulationCommand', 'stop');
+            app.Running = false;
+            app.StatusLabel.Text = 'IDLE';
+            app.log('[Simulation stopped.]');
+            stop(app.TimerObj);
+            app.plotResults();
+        end
+
+        function plotResults(app)
+            try
+                out = evalin('base', 'out');
+                soc_ts = out.SOCValue;
+                ib_ts = out.CurrentValue;
+                vb_ts = out.VoltageValue;
+
+                time = soc_ts.Time;
+                soc_vals = soc_ts.Data;
+                ib_vals = ib_ts.Data;
+                vb_vals = vb_ts.Data;
+
+                clearpoints(app.SoCLine);
+                clearpoints(app.CurrentLine);
+                clearpoints(app.PowerFlowLine);
+
+                for i = 1:length(time)
+                    addpoints(app.SoCLine, time(i), soc_vals(i));
+                    addpoints(app.CurrentLine, time(i), ib_vals(i));
+                    addpoints(app.PowerFlowLine, time(i), vb_vals(i) * ib_vals(i) / 1000);
+                end
+
+                app.SoCGauge.Value = soc_vals(end);
+                app.BatteryCurrentLabel.Text = ['Current: ', num2str(ib_vals(end), '%.2f'), ' A'];
+                app.BatteryVoltageLabel.Text = ['Voltage: ', num2str(vb_vals(end), '%.2f'), ' V'];
+
+                soc_percent = soc_vals(end);
+                estimated_range_km = (soc_percent / 100) * app.BatteryCapacity * 5;
+                app.RangeEstimateLabel.Text = ['Range: ', num2str(estimated_range_km, '%.1f'), ' km'];
+
+                drawnow;
+            catch ME
+                app.log(['[Error reading signals: ', ME.message, ']']);
+            end
+        end
+
+        function log(app, message)
+            timestamp = datestr(now, 'HH:MM:SS');
+            currentLog = app.LogTextArea.Value;
+            app.LogTextArea.Value = [currentLog; {[timestamp ' ' message]}];
+        end
+
+        function createComponents(app)$1
+
+            app.TitleLabel = uilabel(app.UIFigure, 'Text', 'V2G Charging Dashboard', 'FontSize', 16, 'FontWeight', 'bold', 'FontName', 'Segoe UI', 'Position', [20 570 300 22]);
+            app.FooterLabel = uilabel(app.UIFigure, 'Text', '2025 K – V2G Dashboard', 'HorizontalAlignment', 'center', 'FontAngle', 'italic', 'FontName', 'Segoe UI', 'FontSize', 10, 'FontColor', [0.5 0.5 0.5], 'Position', [0 0 1000 22]);
+
+            app.VehicleDropDown = uidropdown(app.UIFigure, 'Items', {'Tractor', 'Leisure boat', 'Motorcycle'}, 'Position', [20 540 150 22], 'FontName', 'Segoe UI', 'FontSize', 11, 'ValueChangedFcn', @(src, event) updateVehicleInfo(app));
+
+            app.VehicleInfoPanel = uipanel(app.UIFigure, 'Title', 'Vehicle Battery Info', 'FontWeight', 'bold', 'Position', [20 470 200 70], 'BackgroundColor', [0.95 0.95 1]);
+            app.VehicleInfoLabel = uilabel(app.VehicleInfoPanel, 'Text', '', 'Position', [10 5 180 40], 'FontSize', 11, 'FontName', 'Segoe UI');
+
+            app.SoCGauge = uigauge(app.UIFigure, 'semicircular', 'Position', [20 380 150 100], 'Limits', [0 100], 'Value', 60, 'FontName', 'Segoe UI');
+            app.BatteryCurrentLabel = uilabel(app.UIFigure, 'Position', [20 350 200 22], 'Text', 'Current:', 'FontName', 'Segoe UI', 'FontWeight', 'bold');
+            app.BatteryVoltageLabel = uilabel(app.UIFigure, 'Position', [20 325 200 22], 'Text', 'Voltage:', 'FontName', 'Segoe UI', 'FontWeight', 'bold');
+            app.RangeEstimateLabel = uilabel(app.UIFigure, 'Position', [20 305 200 22], 'Text', 'Range: N/A', 'FontName', 'Segoe UI', 'FontWeight', 'bold');
+
+            app.ModeSwitchLabel = uilabel(app.UIFigure, 'Text', 'Select Mode:', 'Position', [20 295 100 22], 'FontName', 'Segoe UI');
+            app.ModeSwitch = uibuttongroup(app.UIFigure, 'Position', [20 245 150 50], 'SelectionChangedFcn', @(src, event) switchMode(app));
+            uiradiobutton(app.ModeSwitch, 'Text', 'Charging', 'Position', [10 10 100 22], 'FontName', 'Segoe UI');
+            uiradiobutton(app.ModeSwitch, 'Text', 'Discharging', 'Position', [10 30 100 22], 'FontName', 'Segoe UI');
+
+            app.StartStopButton = uibutton(app.UIFigure, 'push', 'Text', 'Start Simulation', 'Position', [20 200 150 30], 'BackgroundColor', [0.2 0.4 0.8], 'FontColor', 'w', 'FontName', 'Segoe UI', 'ButtonPushedFcn', @(src, event) toggleCharging(app));
+            app.PauseButton = uibutton(app.UIFigure, 'push', 'Text', 'Pause Simulation', 'Position', [20 160 150 30], 'BackgroundColor', [0.8 0.5 0.2], 'FontColor', 'w', 'FontName', 'Segoe UI', 'ButtonPushedFcn', @(src, event) pauseSimulation(app));
+            app.StopButton = uibutton(app.UIFigure, 'push', 'Text', 'Stop Simulation', 'Position', [20 120 150 30], 'BackgroundColor', [0.7 0.2 0.2], 'FontColor', 'w', 'FontName', 'Segoe UI', 'ButtonPushedFcn', @(src, event) stopSimulation(app));
+
+            app.StatusPanel = uipanel(app.UIFigure, 'Position', [20 80 100 30], 'BackgroundColor', [0.85 0.85 0.85]);
+            app.StatusLabel = uilabel(app.StatusPanel, 'Text', 'IDLE', 'FontWeight', 'bold', 'FontName', 'Segoe UI', 'Position', [10 5 80 22]);
+
+            app.PowerFlowPanel = uipanel(app.UIFigure, 'Title', 'Power Flow (kW)', 'Position', [250 370 700 180], 'BackgroundColor', [0.98 0.98 0.98]);
+            app.PowerFlowAxes = uiaxes(app.PowerFlowPanel, 'Position', [10 10 680 150]);
+            xlabel(app.PowerFlowAxes, 'Time'); ylabel(app.PowerFlowAxes, 'kW'); set(app.PowerFlowAxes, 'FontName', 'Segoe UI', 'FontSize', 11);
+
+            app.SoCPanel = uipanel(app.UIFigure, 'Title', 'State of Charge (%)', 'Position', [250 190 340 150], 'BackgroundColor', [0.98 0.98 0.98]);
+            app.SoCAxes = uiaxes(app.SoCPanel, 'Position', [10 10 320 110]);
+            xlabel(app.SoCAxes, 'Time'); ylabel(app.SoCAxes, '%'); set(app.SoCAxes, 'FontName', 'Segoe UI', 'FontSize', 11);
+
+            app.CurrentPanel = uipanel(app.UIFigure, 'Title', 'Battery Current (A)', 'Position', [610 190 340 150], 'BackgroundColor', [0.98 0.98 0.98]);
+            app.CurrentAxes = uiaxes(app.CurrentPanel, 'Position', [10 10 320 110]);
+            xlabel(app.CurrentAxes, 'Time'); ylabel(app.CurrentAxes, 'A'); set(app.CurrentAxes, 'FontName', 'Segoe UI', 'FontSize', 11);
+
+            app.PowerFlowLine = animatedline(app.PowerFlowAxes, 'LineWidth', 2);
+            app.SoCLine = animatedline(app.SoCAxes, 'LineWidth', 2);
+            app.CurrentLine = animatedline(app.CurrentAxes, 'LineWidth', 2);
+
+            app.LogTextArea = uitextarea(app.UIFigure, 'Position', [250 20 700 150], 'Value', {'[Log Initialized...]'}, 'FontName', 'Segoe UI'); ...
+                'ExecutionMode', 'fixedRate', ...
+                'Period', 1, ...
+                'TimerFcn', @(src, event) app.updateLiveSignals());
+        end
+    end
+
+    methods (Access = public)
+        function app = V2GChargingDashboard()
+            createComponents(app);
+        end
+    end
+end
